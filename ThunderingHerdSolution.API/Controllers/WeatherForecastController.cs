@@ -1,4 +1,10 @@
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Configuration;
+using StackExchange.Redis;
+using ThunderingHerdSolution.Core.Abstractions;
+using ThunderingHerdSolution.Core.Constants;
+using ThunderingHerdSolution.Core.Domain;
+using ThunderingHerdSolution.Core.Events;
 
 namespace ThunderingHerdSolution.Controllers
 {
@@ -6,28 +12,55 @@ namespace ThunderingHerdSolution.Controllers
     [Route("[controller]")]
     public class WeatherForecastController : ControllerBase
     {
-        private static readonly string[] Summaries = new[]
-        {
-        "Freezing", "Bracing", "Chilly", "Cool", "Mild", "Warm", "Balmy", "Hot", "Sweltering", "Scorching"
-    };
+        private readonly IConfiguration _configuration;
+        private readonly ICache _cache;
+        private readonly IMessageBroker _messageBroker;
 
-        private readonly ILogger<WeatherForecastController> _logger;
-
-        public WeatherForecastController(ILogger<WeatherForecastController> logger)
+        public WeatherForecastController(IConfiguration configuration, ICache cache, IMessageBroker messageBroker)
         {
-            _logger = logger;
+            _configuration = configuration;
+            _cache = cache;
+            _messageBroker = messageBroker;
         }
 
         [HttpGet(Name = "GetWeatherForecast")]
-        public IEnumerable<WeatherForecast> Get()
+        public async Task<IEnumerable<WeatherForecast>> Get()
         {
-            return Enumerable.Range(1, 5).Select(index => new WeatherForecast
+            var eventHandler = new ThirdPartyApiRequestingEventHandler();
+            string cacheKey = eventHandler.CacheKey;
+
+
+            var cachedObject = await _cache.GetAsync<WeatherForecast[]>(cacheKey);
+            if (cachedObject != null)
+                return cachedObject;
+
+            using (ConnectionMultiplexer redisConnection = ConnectionMultiplexer.Connect(_configuration["Redis:ReplicasConnectionString"]))
             {
-                Date = DateOnly.FromDateTime(DateTime.Now.AddDays(index)),
-                TemperatureC = Random.Shared.Next(-20, 55),
-                Summary = Summaries[Random.Shared.Next(Summaries.Length)]
-            })
-            .ToArray();
+                eventHandler.ExpirationTime = _configuration.GetValue<TimeSpan>("WeatherApiCacheExpiration");
+
+                TaskCompletionSource _waitingSource = new();
+                Task timeOutTask = Task.Delay(_configuration.GetValue<int>("WeatherApitaskTimeOutInMilliSeconds"));
+
+                var pubsub = redisConnection.GetSubscriber();
+                pubsub.Subscribe(AppConstants.CachingJobPublishChannel, (channel, jsonData) =>
+                {
+                    _waitingSource.SetResult();
+                }, CommandFlags.FireAndForget);
+
+                await _messageBroker.PublishAsync(AppConstants.ApiPublishChannel, eventHandler);
+
+                var returnedTask = await Task.WhenAny(_waitingSource.Task, timeOutTask);
+                if (returnedTask == timeOutTask)
+                {
+                    return new WeatherForecast[0];
+                }
+
+                return await _cache.GetAsync<WeatherForecast[]>(cacheKey);
+
+
+            }
         }
     }
 }
+
+

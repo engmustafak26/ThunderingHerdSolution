@@ -1,4 +1,4 @@
-namespace ThunderingHerdSolution
+namespace ThunderingHerdSolution.Core.Domain
 {
     public class WeatherForecast
     {
